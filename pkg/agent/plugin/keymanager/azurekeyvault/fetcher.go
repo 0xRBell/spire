@@ -3,12 +3,13 @@ package azurekeyvault
 import (
 	"context"
 	"crypto/x509"
+	"strings"
 	"sync"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/keyvault/azkeys"
 	"github.com/aws/smithy-go/ptr"
 	"github.com/hashicorp/go-hclog"
-	keymanagerv1 "github.com/spiffe/spire-plugin-sdk/proto/spire/plugin/server/keymanager/v1"
+	keymanagerv1 "github.com/spiffe/spire-plugin-sdk/proto/spire/plugin/agent/keymanager/v1"
 	azkv "github.com/spiffe/spire/pkg/common/plugin/azure_keyvault"
 	"golang.org/x/sync/errgroup"
 	"google.golang.org/grpc/codes"
@@ -18,18 +19,18 @@ import (
 type keyFetcher struct {
 	keyVaultClient cloudKeyManagementService
 	log            hclog.Logger
-	serverID       string
+	agentID        string
 	trustDomain    string
 }
 
 // fetchKeyEntries requests Key Vault to get the list of keys that are
-// active in this server. They are returned as a keyEntry array.
+// active for this agent. They are returned as a keyEntry array.
 func (kf *keyFetcher) fetchKeyEntries(ctx context.Context) ([]*keyEntry, error) {
 	var keyEntries []*keyEntry
 	var keyEntriesMutex sync.Mutex
 	g, ctx := errgroup.WithContext(ctx)
 
-	// List all the key from the configured key vault URL
+	// List all the keys from the configured key vault URL
 	pager := kf.keyVaultClient.NewListKeysPager(nil)
 
 	for pager.More() {
@@ -38,15 +39,15 @@ func (kf *keyFetcher) fetchKeyEntries(ctx context.Context) ([]*keyEntry, error) 
 			return nil, status.Errorf(codes.Internal, "failed while listing keys: %v", err)
 		}
 		for _, key := range resp.Value {
-			// Skip keys that do not belong this server
-			belongsToServer := kf.keyBelongsToServer(key)
-			if !belongsToServer {
+			// Skip keys that do not belong to this agent
+			belongsToAgent := kf.keyBelongsToAgent(key)
+			if !belongsToAgent {
 				continue
 			}
 
-			spireKeyID, ok := spireKeyIDFromKeyName(key.KID.Name())
+			spireKeyID, ok := spireKeyIDFromKeyName(key.KID.Name(), kf.agentID)
 			if !ok {
-				kf.log.Warn("Could not get SPIRE Key ID from key", keyNameTag, key.KID.Name())
+				kf.log.Warn("Could not get SPIRE Key ID from key", "key_name", key.KID.Name())
 				continue
 			}
 
@@ -75,10 +76,10 @@ func (kf *keyFetcher) fetchKeyEntries(ctx context.Context) ([]*keyEntry, error) 
 	return keyEntries, nil
 }
 
-func (kf *keyFetcher) keyBelongsToServer(key *azkeys.KeyItem) bool {
-	trustDomain, hasTD := key.Tags[tagNameServerTrustDomain]
-	serverID, hasServerID := key.Tags[tagNameServerID]
-	return hasTD && hasServerID && *trustDomain == kf.trustDomain && *serverID == kf.serverID
+func (kf *keyFetcher) keyBelongsToAgent(key *azkeys.KeyItem) bool {
+	trustDomain, hasTD := key.Tags[tagNameAgentTrustDomain]
+	agentID, hasAgentID := key.Tags[tagNameAgentID]
+	return hasTD && hasAgentID && *trustDomain == kf.trustDomain && *agentID == kf.agentID
 }
 
 func (kf *keyFetcher) fetchKeyEntryDetails(ctx context.Context, keyItem *azkeys.KeyItem, spireKeyID string) (*keyEntry, error) {
@@ -127,7 +128,7 @@ func (kf *keyFetcher) fetchKeyEntryDetails(ctx context.Context, keyItem *azkeys.
 	}, nil
 }
 
-// sharedKeyTypeToProto converts a shared KeyType to a server proto KeyType.
+// sharedKeyTypeToProto converts a shared KeyType to an agent proto KeyType.
 func sharedKeyTypeToProto(kt azkv.KeyType) keymanagerv1.KeyType {
 	switch kt {
 	case azkv.KeyTypeRSA2048:
@@ -144,17 +145,26 @@ func sharedKeyTypeToProto(kt azkv.KeyType) keymanagerv1.KeyType {
 }
 
 // spireKeyIDFromKeyName parses a Key Vault key name to get the
-// SPIRE Key ID. This Key ID is used in the Server KeyManager interface.
-func spireKeyIDFromKeyName(keyName string) (string, bool) {
-	// A key name would have the format spire-key-${UUID}-x509-CA-A.
-	// first we find the position where the SPIRE Key ID starts.
-	// For that, we need to add the length of the key name prefix that we
-	// are using, the UUID length, and the two "-" separators used in our format.
-	spireKeyIDIndex := len(keyNamePrefix) + 38 // 39 is the UUID length plus two '-' separators
-	if spireKeyIDIndex >= len(keyName) {
-		// The index is out of range.
+// SPIRE Key ID. This Key ID is used in the Agent KeyManager interface.
+// The key name format is: spire-agent-key-<AGENT-ID>-<SPIRE-KEY-ID>
+func spireKeyIDFromKeyName(keyName, agentID string) (string, bool) {
+	// Format: prefix-agentID-spireKeyID
+	prefix := keyNamePrefix + "-"
+	if !strings.HasPrefix(keyName, prefix) {
 		return "", false
 	}
-	spireKeyID := keyName[spireKeyIDIndex:]
+
+	// Find where agentID starts (after prefix)
+	agentIDPrefix := prefix + agentID + "-"
+	if !strings.HasPrefix(keyName, agentIDPrefix) {
+		return "", false
+	}
+
+	// Extract SPIRE Key ID (everything after agentIDPrefix)
+	spireKeyID := keyName[len(agentIDPrefix):]
+	if spireKeyID == "" {
+		return "", false
+	}
+
 	return spireKeyID, true
 }

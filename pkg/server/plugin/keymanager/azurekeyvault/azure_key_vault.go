@@ -2,13 +2,9 @@ package azurekeyvault
 
 import (
 	"context"
-	"crypto/sha256"
 	"crypto/x509"
-	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"math/big"
 	"net/http"
 	"os"
 	"strings"
@@ -20,7 +16,6 @@ import (
 	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
 	"github.com/Azure/azure-sdk-for-go/sdk/keyvault/azkeys"
 	"github.com/andres-erbsen/clock"
-	"github.com/go-jose/go-jose/v4"
 	"github.com/gofrs/uuid/v5"
 	"github.com/hashicorp/go-hclog"
 	"github.com/hashicorp/hcl"
@@ -28,9 +23,8 @@ import (
 	configv1 "github.com/spiffe/spire-plugin-sdk/proto/spire/service/common/config/v1"
 	"github.com/spiffe/spire/pkg/common/catalog"
 	"github.com/spiffe/spire/pkg/common/diskutil"
+	azkv "github.com/spiffe/spire/pkg/common/plugin/azure_keyvault"
 	"github.com/spiffe/spire/pkg/common/pluginconf"
-	"golang.org/x/crypto/cryptobyte"
-	"golang.org/x/crypto/cryptobyte/asn1"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -415,9 +409,10 @@ func (p *Plugin) GenerateKey(ctx context.Context, req *keymanagerv1.GenerateKeyR
 }
 
 func (p *Plugin) createKey(ctx context.Context, spireKeyID string, keyType keymanagerv1.KeyType) (*keyEntry, error) {
-	createKeyParameters, err := getCreateKeyParameters(keyType, p.keyTags)
+	sharedKeyType := protoKeyTypeToShared(keyType)
+	createKeyParameters, err := azkv.GetCreateKeyParameters(sharedKeyType, p.keyTags)
 	if err != nil {
-		return nil, err
+		return nil, status.Errorf(codes.Internal, "unsupported key type: %v", keyType)
 	}
 
 	keyName, err := p.generateKeyName(spireKeyID)
@@ -432,9 +427,9 @@ func (p *Plugin) createKey(ctx context.Context, spireKeyID string, keyType keyma
 	log := p.log.With(keyIDTag, *createResp.Key.KID)
 	log.Debug("Key created", algorithmTag, *createResp.Key.Kty)
 
-	rawKey, err := keyVaultKeyToRawKey(createResp.Key)
+	rawKey, err := azkv.JWKToRawKey(createResp.Key)
 	if err != nil {
-		return nil, err
+		return nil, status.Errorf(codes.Internal, "failed to convert key: %v", err)
 	}
 	publicKey, err := x509.MarshalPKIXPublicKey(rawKey)
 	if err != nil {
@@ -458,7 +453,7 @@ func (p *Plugin) createKey(ctx context.Context, spireKeyID string, keyType keyma
 			Id:          spireKeyID,
 			Type:        keyType,
 			PkixData:    publicKey,
-			Fingerprint: makeFingerprint(publicKey),
+			Fingerprint: azkv.MakeFingerprint(publicKey),
 		},
 	}, nil
 }
@@ -485,7 +480,13 @@ func (p *Plugin) SignData(ctx context.Context, req *keymanagerv1.SignDataRequest
 	keyVersion := key.keyVersion
 	keyFingerprint := key.PublicKey.Fingerprint
 
-	signingAlgo, err := signingAlgorithmForKeyVault(keyType, req.SignerOpts)
+	sharedKeyType := protoKeyTypeToShared(keyType)
+	hashAlgo, isPSS, err := extractHashInfo(req.SignerOpts)
+	if err != nil {
+		return nil, status.Error(codes.InvalidArgument, err.Error())
+	}
+
+	signingAlgo, err := azkv.SigningAlgorithm(sharedKeyType, hashAlgo, isPSS)
 	if err != nil {
 		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
@@ -499,7 +500,7 @@ func (p *Plugin) SignData(ctx context.Context, req *keymanagerv1.SignDataRequest
 	}
 
 	result := signResponse.Result
-	signatureBytes, err := keyVaultSignatureToASN1Encoded(result, keyType)
+	signatureBytes, err := azkv.SignatureToASN1(result, sharedKeyType)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "failed to convert Key Vault signature to ASN.1/DER format: %v", err)
 	}
@@ -508,55 +509,6 @@ func (p *Plugin) SignData(ctx context.Context, req *keymanagerv1.SignDataRequest
 		Signature:      signatureBytes,
 		KeyFingerprint: keyFingerprint,
 	}, nil
-}
-
-// keyVaultSignatureToASN1Encoded converts the signature format from IEEE P1363 to ASN.1/DER for ECDSA signed messages
-// If the message is RSA signed, it's just returned i.e: no conversion needed for RSA signed messages
-// This is all because when the signing algorithm used is ECDSA, azure's Sign API produces an IEEE P1363 format response
-// while we expect the RFC3279 ASN.1 DER Format during signature verification (ecdsa.VerifyASN1).
-func keyVaultSignatureToASN1Encoded(keyVaultSigResult []byte, keyType keymanagerv1.KeyType) ([]byte, error) {
-	isRSA := keyType == keymanagerv1.KeyType_RSA_2048 || keyType == keymanagerv1.KeyType_RSA_4096
-	if isRSA {
-		// No conversion needed, it's already ASN.1 encoded
-		return keyVaultSigResult, nil
-	}
-	sigLength := len(keyVaultSigResult)
-	// The sig byte array length must either be 64 (ec-p256) or 96 (ec-p384)
-	if sigLength != 64 && sigLength != 96 {
-		return nil, status.Errorf(codes.Internal, "malformed signature response")
-	}
-	rVal := new(big.Int)
-	rVal.SetBytes(keyVaultSigResult[0 : sigLength/2])
-	sVal := new(big.Int)
-	sVal.SetBytes(keyVaultSigResult[sigLength/2 : sigLength])
-	var b cryptobyte.Builder
-	b.AddASN1(asn1.SEQUENCE, func(b *cryptobyte.Builder) {
-		b.AddASN1BigInt(rVal)
-		b.AddASN1BigInt(sVal)
-	})
-	return b.Bytes()
-}
-
-// keyVaultKeyToRawKey takes a *azkeys.JSONWebKey and returns the corresponding raw public key
-// For example *ecdsa.PublicKey or *rsa.PublicKey etc
-func keyVaultKeyToRawKey(keyVaultKey *azkeys.JSONWebKey) (any, error) {
-	// Marshal the key to JSON
-	jwkJSON, err := keyVaultKey.MarshalJSON()
-	if err != nil {
-		return nil, status.Errorf(codes.Internal, "failed to marshal key: %v", err)
-	}
-
-	// Parse JWK
-	var key jose.JSONWebKey
-	if err := json.Unmarshal(jwkJSON, &key); err != nil {
-		return nil, status.Errorf(codes.Internal, "failed to parse key: %v", err)
-	}
-
-	if key.Key == nil {
-		return nil, status.Errorf(codes.Internal, "failed to convert Key Vault key to raw key: %v", err)
-	}
-
-	return key.Key, nil
 }
 
 // GetPublicKey returns the public key for a given key
@@ -658,31 +610,6 @@ func (p *Plugin) notifyDelete(err error) {
 	}
 }
 
-func getCreateKeyParameters(keyType keymanagerv1.KeyType, keyTags map[string]*string) (*azkeys.CreateKeyParameters, error) {
-	result := &azkeys.CreateKeyParameters{}
-	switch keyType {
-	case keymanagerv1.KeyType_RSA_2048:
-		result.Kty = to.Ptr(azkeys.JSONWebKeyTypeRSA)
-		result.KeySize = to.Ptr(int32(2048))
-	case keymanagerv1.KeyType_RSA_4096:
-		result.Kty = to.Ptr(azkeys.JSONWebKeyTypeRSA)
-		result.KeySize = to.Ptr(int32(4096))
-	case keymanagerv1.KeyType_EC_P256:
-		result.Kty = to.Ptr(azkeys.JSONWebKeyTypeEC)
-		result.Curve = to.Ptr(azkeys.JSONWebKeyCurveNameP256)
-	case keymanagerv1.KeyType_EC_P384:
-		result.Kty = to.Ptr(azkeys.JSONWebKeyTypeEC)
-		result.Curve = to.Ptr(azkeys.JSONWebKeyCurveNameP384)
-	default:
-		return nil, status.Errorf(codes.Internal, "unsupported key type: %v", keyType)
-	}
-	// Specify the key operations as Sign and Verify
-	result.KeyOps = append(result.KeyOps, to.Ptr(azkeys.JSONWebKeyOperationSign), to.Ptr(azkeys.JSONWebKeyOperationVerify))
-	// Set the key tags
-	result.Tags = keyTags
-	return result, nil
-}
-
 // generateKeyName returns a new identifier to be used as a key name.
 // The returned name has the form: spire-key-<UUID>-<SPIRE-KEY-ID>,
 // where UUID is a new randomly generated UUID and SPIRE-KEY-ID is provided
@@ -750,54 +677,47 @@ func generateUniqueID() (id string, err error) {
 	return u.String(), nil
 }
 
-func makeFingerprint(pkixData []byte) string {
-	s := sha256.Sum256(pkixData)
-	return hex.EncodeToString(s[:])
+// protoKeyTypeToShared converts a proto KeyType to the shared KeyType.
+func protoKeyTypeToShared(kt keymanagerv1.KeyType) azkv.KeyType {
+	switch kt {
+	case keymanagerv1.KeyType_RSA_2048:
+		return azkv.KeyTypeRSA2048
+	case keymanagerv1.KeyType_RSA_4096:
+		return azkv.KeyTypeRSA4096
+	case keymanagerv1.KeyType_EC_P256:
+		return azkv.KeyTypeECP256
+	case keymanagerv1.KeyType_EC_P384:
+		return azkv.KeyTypeECP384
+	default:
+		return azkv.KeyTypeUnspecified
+	}
 }
 
-func signingAlgorithmForKeyVault(keyType keymanagerv1.KeyType, signerOpts any) (azkeys.JSONWebKeySignatureAlgorithm, error) {
-	var (
-		hashAlgo keymanagerv1.HashAlgorithm
-		isPSS    bool
-	)
-
+// extractHashInfo extracts hash algorithm and isPSS flag from signer options.
+func extractHashInfo(signerOpts any) (azkv.HashAlgorithm, bool, error) {
 	switch opts := signerOpts.(type) {
 	case *keymanagerv1.SignDataRequest_HashAlgorithm:
-		hashAlgo = opts.HashAlgorithm
-		isPSS = false
+		return protoHashAlgoToShared(opts.HashAlgorithm), false, nil
 	case *keymanagerv1.SignDataRequest_PssOptions:
 		if opts.PssOptions == nil {
-			return "", errors.New("invalid signerOpts. PSS options are required")
+			return azkv.HashAlgorithmUnspecified, false, errors.New("invalid signerOpts: PSS options are required")
 		}
-		hashAlgo = opts.PssOptions.HashAlgorithm
-		isPSS = true
-		// opts.PssOptions.SaltLength is handled by Key Vault. The salt length matches the bits of the hashing algorithm.
+		return protoHashAlgoToShared(opts.PssOptions.HashAlgorithm), true, nil
 	default:
-		return "", fmt.Errorf("unsupported signer opts type %T", opts)
+		return azkv.HashAlgorithmUnspecified, false, fmt.Errorf("unsupported signer opts type %T", opts)
 	}
+}
 
-	isRSA := keyType == keymanagerv1.KeyType_RSA_2048 || keyType == keymanagerv1.KeyType_RSA_4096
-
-	switch {
-	case hashAlgo == keymanagerv1.HashAlgorithm_UNSPECIFIED_HASH_ALGORITHM:
-		return "", errors.New("hash algorithm is required")
-	case keyType == keymanagerv1.KeyType_EC_P256 && hashAlgo == keymanagerv1.HashAlgorithm_SHA256:
-		return azkeys.JSONWebKeySignatureAlgorithmES256, nil
-	case keyType == keymanagerv1.KeyType_EC_P384 && hashAlgo == keymanagerv1.HashAlgorithm_SHA384:
-		return azkeys.JSONWebKeySignatureAlgorithmES384, nil
-	case isRSA && !isPSS && hashAlgo == keymanagerv1.HashAlgorithm_SHA256:
-		return azkeys.JSONWebKeySignatureAlgorithmRS256, nil
-	case isRSA && !isPSS && hashAlgo == keymanagerv1.HashAlgorithm_SHA384:
-		return azkeys.JSONWebKeySignatureAlgorithmRS384, nil
-	case isRSA && !isPSS && hashAlgo == keymanagerv1.HashAlgorithm_SHA512:
-		return azkeys.JSONWebKeySignatureAlgorithmRS512, nil
-	case isRSA && isPSS && hashAlgo == keymanagerv1.HashAlgorithm_SHA256:
-		return azkeys.JSONWebKeySignatureAlgorithmPS256, nil
-	case isRSA && isPSS && hashAlgo == keymanagerv1.HashAlgorithm_SHA384:
-		return azkeys.JSONWebKeySignatureAlgorithmPS384, nil
-	case isRSA && isPSS && hashAlgo == keymanagerv1.HashAlgorithm_SHA512:
-		return azkeys.JSONWebKeySignatureAlgorithmPS512, nil
+// protoHashAlgoToShared converts a proto HashAlgorithm to the shared HashAlgorithm.
+func protoHashAlgoToShared(ha keymanagerv1.HashAlgorithm) azkv.HashAlgorithm {
+	switch ha {
+	case keymanagerv1.HashAlgorithm_SHA256:
+		return azkv.HashAlgorithmSHA256
+	case keymanagerv1.HashAlgorithm_SHA384:
+		return azkv.HashAlgorithmSHA384
+	case keymanagerv1.HashAlgorithm_SHA512:
+		return azkv.HashAlgorithmSHA512
 	default:
-		return "", fmt.Errorf("unsupported combination of key type: %v and hashing algorithm: %v", keyType, hashAlgo)
+		return azkv.HashAlgorithmUnspecified
 	}
 }
